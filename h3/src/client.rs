@@ -8,18 +8,23 @@ use std::{
 };
 
 use bytes::{Buf, Bytes, BytesMut};
-use futures_util::future;
+use futures_util::{
+    future::{self, Future},
+    ready,
+};
 use http::{request, HeaderMap, Response};
+use pin_project_lite::pin_project;
 use tracing::{info, trace};
 
 use crate::{
     config::Config,
     connection::{self, ConnectionInner, ConnectionState, SharedStateRef},
     error::{Code, Error, ErrorLevel},
+    ext::Datagram,
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
     qpack,
-    quic::{self, StreamId},
+    quic::{self, StreamId, SendDatagramExt, RecvDatagramExt},
     stream::{self, BufRecvStream},
 };
 
@@ -463,6 +468,36 @@ where
     }
 }
 
+impl<C, B> Connection<C, B>
+where
+    C: quic::Connection<B> + SendDatagramExt<B>,
+    B: Buf,
+{
+    /// Sends a datagram
+    pub fn send_datagram(&mut self, stream_id: StreamId, data: B) -> Result<(), Error> {
+        self.inner
+            .conn
+            .send_datagram(Datagram::new(stream_id, data))?;
+        tracing::info!("Sent datagram");
+
+        Ok(())
+    }
+}
+
+impl<C, B> Connection<C, B>
+where
+    C: quic::Connection<B> + RecvDatagramExt,
+    B: Buf,
+{
+    /// Reads an incoming datagram
+    pub fn read_datagram(&mut self) -> ReadDatagram<C, B> {
+        ReadDatagram {
+            conn: self,
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// HTTP/3 client builder
 ///
 /// Set the configuration for a new client.
@@ -516,6 +551,20 @@ impl Builder {
     /// and accommodate future changes without breaking existing implementations.
     pub fn send_grease(&mut self, enabled: bool) -> &mut Self {
         self.config.send_grease = enabled;
+        self
+    }
+
+    /// Enables the CONNECT protocol
+    pub fn enable_connect(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_extended_connect = value;
+        self
+    }
+
+        /// Indicates that the client or server supports HTTP/3 datagrams
+    ///
+    /// See: <https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1>
+    pub fn enable_datagram(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_datagram = value;
         self
     }
 
@@ -704,6 +753,11 @@ where
         // rename `cancel()` ?
         self.inner.stream.stop_sending(error_code)
     }
+
+    /// Returns the underlying stream id
+    pub fn id(&self) -> StreamId {
+        self.inner.stream.id()
+    }
 }
 
 impl<S, B> RequestStream<S, B>
@@ -757,5 +811,33 @@ where
     ) {
         let (send, recv) = self.inner.split();
         (RequestStream { inner: send }, RequestStream { inner: recv })
+    }
+}
+
+pin_project! {
+    /// Future for [`Connection::read_datagram`]
+    pub struct ReadDatagram<'a, C, B>
+    where
+            C: quic::Connection<B>,
+            B: Buf,
+        {
+            conn: &'a mut Connection<C, B>,
+            _marker: PhantomData<B>,
+        }
+}
+
+impl<'a, C, B> Future for ReadDatagram<'a, C, B>
+where
+    C: quic::Connection<B> + RecvDatagramExt,
+    B: Buf,
+{
+    type Output = Result<Option<Datagram<C::Buf>>, Error>;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        tracing::trace!("poll: read_datagram");
+        match ready!(self.conn.inner.conn.poll_accept_datagram(cx))? {
+            Some(v) => Poll::Ready(Ok(Some(Datagram::decode(v)?))),
+            None => Poll::Ready(Ok(None)),
+        }
     }
 }
